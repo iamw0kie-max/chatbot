@@ -11,6 +11,8 @@ from mysql.connector import Error
 import pandas as pd
 from datetime import datetime
 from dateutil import parser as dateparser
+import matplotlib.pyplot as plt
+
 
 # ======================================================
 # Optional OpenAI Support
@@ -543,44 +545,440 @@ def parse_resume(text, source_file=""):
 # Simple Chat Agent
 # ======================================================
 def query_chat_agent_rule(db, question):
-    q = question.lower()
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    import re
+    import streamlit as st
+
+    q = question.lower().strip()
     cur = db.connection.cursor(dictionary=True)
 
-    # === Global profile count ===
-    if re.search(r"\b(how many|count|total)\b", q) and re.search(r"\b(profile|employee|record|resume|people|person|candidates?)\b", q):
-        cur.execute("SELECT COUNT(*) AS c FROM employees")
-        c = cur.fetchone()["c"]
-        return f"There are {c} profiles in the database."
+    # --- 🧠 Detect multiple skills ---
+    matched_skills = [s for s in SKILLS_DB if len(s) > 1 and s.lower() in q]
+    has_and = " and " in q
+    has_or = " or " in q
+    skill_logic = "AND" if has_and else "OR"
+    skill_filter = ""
+    if matched_skills:
+        skill_filter = f" {skill_logic} ".join(["skills LIKE %s" for _ in matched_skills])
 
-    # === Skill-based count ===
-    for s in SKILLS_DB:
-        if s.lower() in q and ("how many" in q or "count" in q):
-            cur.execute("SELECT COUNT(*) AS c FROM employees WHERE skills LIKE %s", (f"%{s}%",))
-            c = cur.fetchone()["c"]
-            return f"There are {c} employees skilled in {s}."
-
-    # === Skill-based listing ===
-    for s in SKILLS_DB:
-        if s.lower() in q and ("list" in q or "who" in q):
-            cur.execute("SELECT full_name, company FROM employees WHERE skills LIKE %s", (f"%{s}%",))
-            rows = cur.fetchall()
-            if rows:
-                lines = [f"- {r['full_name']} ({r['company']})" for r in rows]
-                return "Here are the employees skilled in " + s + ":\n" + "\n".join(lines)
-            else:
-                return f"No employees found skilled in {s}."
-
-    # === Company-based queries ===
-    if "company" in q or "organization" in q:
-        cur.execute("SELECT DISTINCT company FROM employees WHERE company <> ''")
-        companies = [r["company"] for r in cur.fetchall()]
-        if companies:
-            return "We have profiles from these companies:\n- " + "\n- ".join(sorted(companies))
+    # --- ⚙️ Detect experience conditions ---
+    exp_pattern = re.search(
+        r"(?:experience|exp)\s*(?:>=|<=|>|<|=|between)?\s*([\d]+)(?:\s*(?:and|to|-)\s*(\d+))?",
+        q,
+    )
+    exp_clause = ""
+    exp_params = []
+    desc = ""
+    if exp_pattern:
+        num1 = int(exp_pattern.group(1))
+        num2 = exp_pattern.group(2)
+        if ">=" in q:
+            exp_clause, desc = "experience_years >= %s", f"at least {num1}"
+            exp_params.append(num1)
+        elif "<=" in q:
+            exp_clause, desc = "experience_years <= %s", f"at most {num1}"
+            exp_params.append(num1)
+        elif ">" in q:
+            exp_clause, desc = "experience_years > %s", f"more than {num1}"
+            exp_params.append(num1)
+        elif "<" in q:
+            exp_clause, desc = "experience_years < %s", f"less than {num1}"
+            exp_params.append(num1)
+        elif "=" in q:
+            exp_clause, desc = "experience_years = %s", f"exactly {num1}"
+            exp_params.append(num1)
+        elif "between" in q or "to" in q or "-" in q:
+            exp_clause, desc = "experience_years BETWEEN %s AND %s", f"between {num1} and {num2}"
+            exp_params.extend([num1, int(num2)])
         else:
-            return "No company information found in the database."
+            exp_clause, desc = "experience_years > %s", f"more than {num1}"
+            exp_params.append(num1)
 
-    # === Fallback ===
-    return "🤖 I couldn’t understand that question. Try asking like: 'How many profiles do we have?' or 'Who knows Python?'"
+    # === 🏢 Company + Experience (+ optional Skill) Filtering ===
+    if re.search(r"(list|show|find|display|employees|people|who)", q) and re.search(
+        r"(company|tcs|infosys|wipro|accenture|bytescale|zen|dataverse|nextiq|quantedge|tech|solutions|consultancy)",
+        q,
+    ):
+        company_match = re.search(
+            r"(?:from|at|in|company)\s+([A-Za-z&\.\- ]{2,60}?)(?=\s+(?:with|having|where|who|exp|experience|years|and|,|$))",
+            q,
+            re.IGNORECASE,
+        )
+        company = ""
+        if company_match:
+            company = company_match.group(1).strip()
+            company = re.sub(
+                r"\b(list|show|display|people|employees|who|with|having|in|at|the|company)\b",
+                "",
+                company,
+                flags=re.IGNORECASE,
+            ).strip()
+
+        company_aliases = {
+            "tata consultancy": "Tata Consultancy",
+            "tata consultancy services": "Tata Consultancy Services",
+            "tcs": "Tata Consultancy Services",
+            "bytescale it": "ByteScale IT",
+            "dataverse": "DataVerse",
+            "nextiq": "NextIQ Software",
+            "quantedge": "QuantEdge Innovations",
+        }
+        for key, val in company_aliases.items():
+            if key in company.lower():
+                company = val
+                break
+
+        where_clauses = []
+        params = []
+        if company:
+            where_clauses.append("company LIKE %s")
+            params.append(f"%{company}%")
+        if exp_clause:
+            where_clauses.append(exp_clause)
+            params.extend(exp_params)
+        if skill_filter:
+            where_clauses.append(f"({skill_filter})")
+            params.extend([f"%{s}%" for s in matched_skills])
+
+        query = f"""
+            SELECT full_name, company, skills, experience_years
+            FROM employees
+            WHERE {' AND '.join(where_clauses) if where_clauses else '1=1'}
+            ORDER BY experience_years DESC
+        """
+        cur.execute(query, tuple(params))
+        rows = cur.fetchall()
+
+        if not rows:
+            return f"🤖 No employees found for company '{company}' with {desc} years of experience."
+
+        df = pd.DataFrame(rows)
+        st.dataframe(df)
+        if matched_skills:
+            return f"📋 Employees skilled in {', '.join(matched_skills)} from {company.upper()} with {desc} of experience."
+        else:
+            return f"📋 Employees from {company.upper()} with {desc} of experience."
+
+    # --- 📊 Chart Detection ---
+    if re.search(r"(chart|plot|graph|visual|bar|pie|trend)", q):
+
+        # === Skill Chart ===
+        if "skill" in q:
+            query = """
+                SELECT skill, COUNT(*) AS freq
+                FROM (
+                    SELECT TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(skills, ',', n.n), ',', -1)) AS skill
+                    FROM employees
+                    JOIN (
+                        SELECT a.N + b.N * 10 + 1 AS n
+                        FROM (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+                              UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a,
+                             (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+                              UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b
+                    ) n
+                    WHERE n.n <= 1 + LENGTH(skills) - LENGTH(REPLACE(skills, ',', ''))
+                ) AS derived
+                WHERE skill <> ''
+                GROUP BY skill
+                ORDER BY freq DESC
+                LIMIT 10
+            """
+            cur.execute(query)
+            rows = cur.fetchall()
+            if not rows:
+                return "No data available to plot."
+
+            skills = [r["skill"] for r in rows]
+            freqs = [r["freq"] for r in rows]
+
+            plt.figure(figsize=(8, 4))
+            if "pie" in q:
+                plt.pie(freqs, labels=skills, autopct="%1.1f%%")
+                plt.title("Skill Distribution (Top 10)")
+            elif "trend" in q or "line" in q:
+                plt.plot(skills, freqs, marker="o")
+                plt.title("Skill Trend (Top 10)")
+                plt.ylabel("Profiles")
+                plt.xlabel("Skill")
+            else:
+                plt.barh(skills[::-1], freqs[::-1])
+                plt.title("Top 10 Skills in Database")
+                plt.xlabel("Profiles")
+                plt.ylabel("Skill")
+            st.pyplot(plt)
+            return "📊 Skill distribution chart displayed."
+
+        # === Company Chart ===
+        if "company" in q:
+            query = """
+                SELECT company, COUNT(*) AS total
+                FROM employees
+                WHERE company <> ''
+                GROUP BY company
+                ORDER BY total DESC
+                LIMIT 10
+            """
+            cur.execute(query)
+            rows = cur.fetchall()
+            if not rows:
+                return "No company data to plot."
+
+            companies = [r["company"] for r in rows]
+            counts = [r["total"] for r in rows]
+
+            plt.figure(figsize=(8, 4))
+            if "pie" in q:
+                plt.pie(counts, labels=companies, autopct="%1.1f%%")
+                plt.title("Company Distribution (Top 10)")
+            elif "trend" in q or "line" in q:
+                plt.plot(companies, counts, marker="o")
+                plt.title("Company Profile Trend")
+                plt.ylabel("Profiles")
+                plt.xlabel("Company")
+            else:
+                plt.barh(companies[::-1], counts[::-1])
+                plt.title("Top 10 Companies by Profiles")
+                plt.xlabel("Profiles")
+                plt.ylabel("Company")
+            st.pyplot(plt)
+            return "🏢 Company chart displayed."
+
+        # === Average Experience Chart ===
+        if "experience" in q:
+            query = """
+                SELECT company, ROUND(AVG(experience_years),1) AS avg_exp
+                FROM employees
+                WHERE company <> ''
+                GROUP BY company
+                HAVING COUNT(*) > 1
+                ORDER BY avg_exp DESC
+                LIMIT 10
+            """
+            cur.execute(query)
+            rows = cur.fetchall()
+            if not rows:
+                return "No experience data to plot."
+
+            companies = [r["company"] for r in rows]
+            avg_exp = [r["avg_exp"] for r in rows]
+
+            plt.figure(figsize=(8, 4))
+            if "pie" in q:
+                plt.pie(avg_exp, labels=companies, autopct="%1.1f%%")
+                plt.title("Average Experience by Company")
+            elif "trend" in q or "line" in q:
+                plt.plot(companies, avg_exp, marker="o")
+                plt.title("Experience Trend by Company")
+                plt.ylabel("Average Experience (Years)")
+                plt.xlabel("Company")
+            else:
+                plt.barh(companies[::-1], avg_exp[::-1])
+                plt.title("Top 10 Companies by Average Experience")
+                plt.xlabel("Average Experience (Years)")
+                plt.ylabel("Company")
+            st.pyplot(plt)
+            return "📈 Average experience chart displayed."
+
+    # --- 👩‍💻 NEW: Skill-Only Query ---
+    if re.search(r"(list|show|find|display|who|people|developers|employees)", q) and matched_skills and not re.search(r"(company|experience|exp|years)", q):
+        query = f"""
+            SELECT full_name, company, experience_years
+            FROM employees
+            WHERE {skill_filter}
+            ORDER BY experience_years DESC
+            LIMIT 20
+        """
+        cur.execute(query, tuple(f"%{s}%" for s in matched_skills))
+        rows = cur.fetchall()
+        if not rows:
+            return f"🤖 No employees found skilled in {', '.join(matched_skills)}."
+
+        df = pd.DataFrame(rows)
+        st.dataframe(df)
+        if len(matched_skills) > 1 and has_and:
+            return f"📋 Employees skilled in all of ({', '.join(matched_skills)}) shown above."
+        elif len(matched_skills) > 1:
+            return f"📋 Employees skilled in any of ({', '.join(matched_skills)}) shown above."
+        else:
+            return f"📋 Here are employees skilled in {', '.join(matched_skills)}."
+
+    # --- 🧮 Top Companies by Skill ---
+    # --- 🏢 Top Companies by Skill ---
+    if re.search(r"(company|companies|organization|organizations)", q) and (
+        re.search(r"(most|top|best|leading|popular|for|in)", q)
+    ):
+        if matched_skills:
+            query = f"""
+                SELECT company, COUNT(*) AS total, ROUND(AVG(experience_years),1) AS avg_exp
+                FROM employees
+                WHERE ({skill_filter}) AND company <> ''
+                GROUP BY company
+                ORDER BY total DESC
+                LIMIT 10
+            """
+            cur.execute(query, tuple(f"%{s}%" for s in matched_skills))
+            rows = cur.fetchall()
+            if not rows:
+                return f"🤖 No companies found for {', '.join(matched_skills)}."
+
+            df = pd.DataFrame(rows)
+            st.dataframe(df)
+            lines = [f"- {r['company']} ({r['total']} profiles, avg {r['avg_exp']} yrs exp)" for r in rows]
+            return f"🏢 Top companies for {', '.join(matched_skills)}:\n" + "\n".join(lines)
+
+
+    # --- 🧩 Average Experience Analytics ---
+    if "average" in q and ("company" in q or "organization" in q):
+        query = """
+            SELECT company, ROUND(AVG(experience_years),1) AS avg_exp, COUNT(*) AS count
+            FROM employees
+            WHERE company <> ''
+            GROUP BY company
+            HAVING COUNT(*) > 1
+            ORDER BY avg_exp DESC
+            LIMIT 10
+        """
+        cur.execute(query)
+        rows = cur.fetchall()
+        if rows:
+            lines = [f"- {r['company']} ({r['avg_exp']} yrs avg, {r['count']} profiles)" for r in rows]
+            return "📊 Top companies by average experience:\n" + "\n".join(lines)
+        else:
+            return "No company experience data found."
+
+    # --- 🧠 Skill Distribution Analytics ---
+    if re.search(r"(skill|skills).*(most|top|popular|common|distribution)", q):
+        query = """
+            SELECT skill, COUNT(*) AS freq
+            FROM (
+                SELECT TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(skills, ',', n.n), ',', -1)) AS skill
+                FROM employees
+                JOIN (
+                    SELECT a.N + b.N * 10 + 1 AS n
+                    FROM (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+                          UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a,
+                         (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+                          UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b
+                ) n
+                WHERE n.n <= 1 + LENGTH(skills) - LENGTH(REPLACE(skills, ',', ''))
+            ) AS derived
+            WHERE skill <> ''
+            GROUP BY skill
+            ORDER BY freq DESC
+            LIMIT 15
+        """
+        cur.execute(query)
+        rows = cur.fetchall()
+        if rows:
+            lines = [f"- {r['skill']} ({r['freq']} profiles)" for r in rows]
+            return "🧠 Most common skills:\n" + "\n".join(lines)
+        else:
+            return "No skill data available."
+    # --- 👨‍💻 Experience-Only Queries (no skill or company mentioned) ---
+    if re.search(r"(experience|exp)", q) and not matched_skills and not re.search(r"(company|organization|firm|enterprise)", q):
+        if exp_clause:
+            query = f"""
+                SELECT full_name, company, experience_years
+                FROM employees
+                WHERE {exp_clause}
+                ORDER BY experience_years DESC
+                LIMIT 25
+            """
+            cur.execute(query, tuple(exp_params))
+            rows = cur.fetchall()
+
+            if not rows:
+                return f"🤖 No employees found with {desc} experience."
+
+            df = pd.DataFrame(rows)
+            st.dataframe(df)
+
+            count = len(rows)
+            avg_exp = sum([r["experience_years"] for r in rows]) / count if count else 0
+
+            # --- 📊 Add Experience Distribution Chart ---
+            plt.figure(figsize=(6, 3))
+            plt.hist([r["experience_years"] for r in rows], bins=6, edgecolor="black")
+            plt.title(f"Experience Distribution ({desc})")
+            plt.xlabel("Experience (Years)")
+            plt.ylabel("Number of Employees")
+            st.pyplot(plt)
+
+            return (
+                f"📋 Found **{count} employees** with {desc} experience "
+                f"(average experience: {avg_exp:.1f} years)."
+            )
+        else:
+            return "⚙️ Please specify an experience filter (e.g., '> 5 years', '< 10 years', 'between 3 and 8 years')."
+    # --- 📊 Count Queries (e.g. "how many resumes", "how many employees from TCS") ---
+    if re.search(r"how many|count|number of", q):
+        where_clauses = []
+        params = []
+
+        # Skill filter
+        if matched_skills:
+            where_clauses.append(f"({skill_filter})")
+            params.extend([f"%{s}%" for s in matched_skills])
+
+        # Company filter
+        company_match = re.search(
+            r"(?:from|at|in|company)\s+([A-Za-z&\.\- ]{2,60})",
+            q,
+            re.IGNORECASE,
+        )
+        company = ""
+        if company_match:
+            company = company_match.group(1).strip()
+            company_aliases = {
+                "tata consultancy": "Tata Consultancy",
+                "tata consultancy services": "Tata Consultancy Services",
+                "tcs": "Tata Consultancy Services",
+                "bytescale it": "ByteScale IT",
+                "dataverse": "DataVerse",
+                "nextiq": "NextIQ Software",
+                "quantedge": "QuantEdge Innovations",
+            }
+            for key, val in company_aliases.items():
+                if key in company.lower():
+                    company = val
+                    break
+            where_clauses.append("company LIKE %s")
+            params.append(f"%{company}%")
+
+        # Experience filter
+        if exp_clause:
+            where_clauses.append(exp_clause)
+            params.extend(exp_params)
+
+        # Build query
+        query = f"""
+            SELECT COUNT(*) AS total
+            FROM employees
+            WHERE {' AND '.join(where_clauses) if where_clauses else '1=1'}
+        """
+        cur.execute(query, tuple(params))
+        result = cur.fetchone()
+        total = result["total"] if result else 0
+
+        # Build response message
+        parts = []
+        if matched_skills:
+            parts.append(f"skilled in {', '.join(matched_skills)}")
+        if company:
+            parts.append(f"from {company}")
+        if desc:
+            parts.append(f"with {desc} experience")
+
+        filter_text = " ".join(parts) if parts else ""
+        return f"📄 There are **{total} resumes** {filter_text.strip()} in the database."
+
+    # --- Default Fallback ---
+    return "🤖 I couldn’t understand that question. Try asking: 'list employees from company TCS with exp > 5', 'show skill distribution chart', or 'average experience per company'."
+
+
+
+
 
 
 # ======================================================
@@ -634,19 +1032,69 @@ with tabs[1]:
 
 # === Chat Agent Tab ===
 with tabs[2]:
-    st.subheader("💬 Ask about resumes")
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    for m in st.session_state.messages:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
-    prompt = st.chat_input("Ask something...")
-    if prompt:
-        st.chat_message("user").markdown(prompt)
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        reply = query_chat_agent_rule(db, prompt) if db else "⚠️ Connect to DB first."
-        st.chat_message("assistant").markdown(reply)
-        st.session_state.messages.append({"role": "assistant", "content": reply})
+    import re
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    st.subheader("💬 Resume Chat Agent")
+
+    # 1️⃣ Initialize session state
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []        # list of (role, content)
+    if "last_result" not in st.session_state:
+        st.session_state.last_result = None       # stores last query result (table/chart/text)
+
+    # 2️⃣ Display existing chat history
+    for role, msg in st.session_state.chat_history:
+        with st.chat_message(role):
+            st.markdown(msg)
+
+    # 3️⃣ Chat input — always rendered last, never inside containers
+    user_query = st.chat_input("Ask something... (e.g., 'list people from TCS with >5 years exp')")
+
+    # 4️⃣ Process user query
+    if user_query:
+        # --- show user message immediately ---
+        with st.chat_message("user"):
+            st.markdown(user_query)
+
+        # --- run your rule-based logic ---
+        reply = query_chat_agent_rule(db, user_query)
+
+        # --- clear last result safely ---
+        st.session_state.last_result = None
+
+        # --- display assistant reply ---
+        with st.chat_message("assistant"):
+            st.markdown("🔍 Processing your query...")
+            st.divider()
+            st.markdown(reply)
+
+        # --- append conversation ---
+        st.session_state.chat_history.append(("user", user_query))
+        st.session_state.chat_history.append(("assistant", reply))
+
+        # --- render structured output (optional) ---
+        matched_skills = [s for s in SKILLS_DB if len(s) > 1 and s.lower() in user_query.lower()]
+        company_match = re.search(r"(?:from|at|in|company)\s+([A-Za-z&.\- ]{2,60})", user_query, re.IGNORECASE)
+        company = company_match.group(1).strip() if company_match else ""
+        exp_match = re.search(r"(\d{1,2})\s*(?:\+)?\s*(?:years?|yrs?)", user_query, re.IGNORECASE)
+        exp_val = exp_match.group(1) if exp_match else ""
+
+        with st.expander("🧠 Interpreted Query", expanded=False):
+            st.write(f"- **Skill:** {', '.join(matched_skills) or 'Not detected'}")
+            st.write(f"- **Company:** {company or 'Not detected'}")
+            st.write(f"- **Experience:** {exp_val + ' years' if exp_val else 'Not specified'}")
+
+    # 5️⃣ Utility buttons
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🧹 Clear Conversation"):
+            st.session_state.chat_history = []
+            st.session_state.last_result = None
+            st.rerun()
+    with col2:
+        st.caption("Chat is local and rule-based — no external API used.")
 
 if db:
     db.connection.close()
